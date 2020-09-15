@@ -11,6 +11,7 @@ type ParseResult<'a, T> = std::result::Result<(T, Term<'a>), nom::Err<(T, nom::e
 
 // alphabetical order
 const ATOM_TAG: &[u8] = &[100];
+const ATOM_UTF8_TAG: &[u8] = &[118];
 const BINARY_TAG: &[u8] = &[109];
 const INTEGER_TAG: &[u8] = &[98];
 const LARGE_BIG_TAG: &[u8] = &[111];
@@ -18,6 +19,8 @@ const LIST_TAG: &[u8] = &[108];
 const MAP_TAG: &[u8] = &[116];
 const NEW_FLOAT_TAG: &[u8] = &[70];
 const NIL_TAG: &[u8] = &[106];
+const SMALL_ATOM: &[u8] = &[115];
+const SMALL_ATOM_UTF8_TAG: &[u8] = &[119];
 const SMALL_BIG_TAG: &[u8] = &[110];
 const SMALL_INTEGER_TAG: &[u8] = &[97];
 const VERSION_NUMBER_TAG: &[u8] = &[131];
@@ -61,17 +64,36 @@ fn term(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, res) = alt((
         binary,
         atom,
-        map,
-        list,
+        atom_utf8,
         integer,
         new_float,
         nil,
         small_integer,
+        small_atom_utf8,
+        map,
+        list,
         small_big,
         large_big,
+        small_atom,
     ))(s)?;
 
     Ok((s, res))
+}
+
+fn atom(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(ATOM_TAG)(s)?;
+    let (s, len) = be_u16(s)?;
+    let (s, string) = take(len)(s)?;
+
+    Ok((s, Term::Atom(std::str::from_utf8(string).unwrap())))
+}
+
+fn atom_utf8(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(ATOM_UTF8_TAG)(s)?;
+    let (s, len) = be_u16(s)?;
+    let (s, string) = take(len)(s)?;
+
+    Ok((s, Term::Atom(std::str::from_utf8(string).unwrap())))
 }
 
 fn binary(s: &[u8]) -> IResult<&[u8], Term> {
@@ -82,36 +104,11 @@ fn binary(s: &[u8]) -> IResult<&[u8], Term> {
     Ok((s, Term::Binary(std::str::from_utf8(string).unwrap())))
 }
 
-fn new_float(s: &[u8]) -> IResult<&[u8], Term> {
-    let (s, _) = tag(NEW_FLOAT_TAG)(s)?;
-    let (s, float) = be_f64(s)?;
+fn integer(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(INTEGER_TAG)(s)?;
+    let (s, integer) = be_i32(s)?;
 
-    Ok((s, Term::NewFloat(float)))
-}
-
-fn small_integer(s: &[u8]) -> IResult<&[u8], Term> {
-    let (s, _) = tag(SMALL_INTEGER_TAG)(s)?;
-    let (s, small_integer) = be_u8(s)?;
-
-    Ok((s, Term::SmallInteger(small_integer)))
-}
-
-fn small_big(s: &[u8]) -> IResult<&[u8], Term> {
-    let (s, _) = tag(SMALL_BIG_TAG)(s)?;
-    let (s, n) = be_u8(s)?;
-    let (s, sign_byte) = be_u8(s)?;
-    let (s, digits) = count(be_u8, n as usize)(s)?;
-
-    let sign = if sign_byte == 1 {
-        num_bigint::Sign::Minus
-    } else {
-        num_bigint::Sign::Plus
-    };
-
-    Ok((
-        s,
-        Term::SmallBig(num_bigint::BigInt::from_radix_le(sign, &digits, 256).unwrap()),
-    ))
+    Ok((s, Term::Integer(integer)))
 }
 
 fn large_big(s: &[u8]) -> IResult<&[u8], Term> {
@@ -132,11 +129,13 @@ fn large_big(s: &[u8]) -> IResult<&[u8], Term> {
     ))
 }
 
-fn integer(s: &[u8]) -> IResult<&[u8], Term> {
-    let (s, _) = tag(INTEGER_TAG)(s)?;
-    let (s, integer) = be_i32(s)?;
+fn list(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(LIST_TAG)(s)?;
+    let (s, number_of_elements) = be_u32(s)?;
+    let (s, elements) = count(term, number_of_elements as usize)(s)?;
+    let (s, _term) = nil(s)?;
 
-    Ok((s, Term::Integer(integer)))
+    Ok((s, Term::List(elements)))
 }
 
 fn map(s: &[u8]) -> IResult<&[u8], Term> {
@@ -151,32 +150,95 @@ fn map(s: &[u8]) -> IResult<&[u8], Term> {
     Ok((s, Term::Map(hm)))
 }
 
+fn new_float(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(NEW_FLOAT_TAG)(s)?;
+    let (s, float) = be_f64(s)?;
+
+    Ok((s, Term::NewFloat(float)))
+}
+
 fn nil(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(NIL_TAG)(s)?;
 
     Ok((s, Term::Nil))
 }
 
-fn list(s: &[u8]) -> IResult<&[u8], Term> {
-    let (s, _) = tag(LIST_TAG)(s)?;
-    let (s, number_of_elements) = be_u32(s)?;
-    let (s, elements) = count(term, number_of_elements as usize)(s)?;
-    let (s, _term) = nil(s)?;
-
-    Ok((s, Term::List(elements)))
-}
-
-fn atom(s: &[u8]) -> IResult<&[u8], Term> {
-    let (s, _) = tag(ATOM_TAG)(s)?;
-    let (s, len) = be_u16(s)?;
+fn small_atom(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(SMALL_ATOM)(s)?;
+    let (s, len) = be_u8(s)?;
     let (s, string) = take(len)(s)?;
 
     Ok((s, Term::Atom(std::str::from_utf8(string).unwrap())))
 }
 
+fn small_atom_utf8(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(SMALL_ATOM_UTF8_TAG)(s)?;
+    let (s, len) = be_u8(s)?;
+    let (s, string) = take(len)(s)?;
+
+    Ok((s, Term::Atom(std::str::from_utf8(string).unwrap())))
+}
+
+fn small_big(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(SMALL_BIG_TAG)(s)?;
+    let (s, n) = be_u8(s)?;
+    let (s, sign_byte) = be_u8(s)?;
+    let (s, digits) = count(be_u8, n as usize)(s)?;
+
+    let sign = if sign_byte == 1 {
+        num_bigint::Sign::Minus
+    } else {
+        num_bigint::Sign::Plus
+    };
+
+    Ok((
+        s,
+        Term::SmallBig(num_bigint::BigInt::from_radix_le(sign, &digits, 256).unwrap()),
+    ))
+}
+
+fn small_integer(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(SMALL_INTEGER_TAG)(s)?;
+    let (s, small_integer) = be_u8(s)?;
+
+    Ok((s, Term::SmallInteger(small_integer)))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    #[test]
+    fn atom() {
+        let string = [131, 100, 0, 5, 104, 101, 108, 108, 111];
+        let (remaining, parsed) = parse(&string).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(parsed, Term::Atom("hello"));
+    }
+
+    #[test]
+    fn atom_utf8() {
+        let string = [131, 118, 0, 5, 104, 101, 108, 108, 111];
+        let (remaining, parsed) = parse(&string).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(parsed, Term::Atom("hello"));
+    }
+
+    #[test]
+    fn small_atom() {
+        let string = [131, 115, 5, 104, 101, 108, 108, 111];
+        let (remaining, parsed) = parse(&string).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(parsed, Term::Atom("hello"));
+    }
+
+    #[test]
+    fn small_atom_utf8() {
+        let string = [131, 119, 5, 104, 101, 108, 108, 111];
+        let (remaining, parsed) = parse(&string).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(parsed, Term::Atom("hello"));
+    }
 
     #[test]
     fn string() {
