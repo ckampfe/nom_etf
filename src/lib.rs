@@ -1,30 +1,29 @@
 use nom::branch::alt;
-use nom::bytes::streaming::tag;
-use nom::bytes::streaming::take;
+use nom::bytes::complete::tag;
+use nom::bytes::complete::take;
 use nom::combinator::complete;
 use nom::multi::count;
-use nom::number::streaming::{be_f64, be_i32, be_u16, be_u32, be_u8};
+use nom::number::complete::{be_f64, be_i32, be_u16, be_u32, be_u8};
 use nom::sequence::pair;
 use nom::IResult;
 use std::collections::BTreeMap;
-use serde::Serialize;
 
 type ParseResult<'a, T> = std::result::Result<(T, Term<'a>), nom::Err<(T, nom::error::ErrorKind)>>;
 
-const VERSION_NUMBER_TAG: &[u8] = &[131];
-const NEW_FLOAT_TAG: &[u8] = &[70];
-const SMALL_INTEGER_TAG: &[u8] = &[97];
-const INTEGER_TAG: &[u8] = &[98];
+// alphabetical order
 const ATOM_TAG: &[u8] = &[100];
-const NIL_TAG: &[u8] = &[106];
-const LIST_TAG: &[u8] = &[108];
 const BINARY_TAG: &[u8] = &[109];
-const SMALL_BIG_TAG: &[u8] = &[110];
+const INTEGER_TAG: &[u8] = &[98];
+const LARGE_BIG_TAG: &[u8] = &[111];
+const LIST_TAG: &[u8] = &[108];
 const MAP_TAG: &[u8] = &[116];
+const NEW_FLOAT_TAG: &[u8] = &[70];
+const NIL_TAG: &[u8] = &[106];
+const SMALL_BIG_TAG: &[u8] = &[110];
+const SMALL_INTEGER_TAG: &[u8] = &[97];
+const VERSION_NUMBER_TAG: &[u8] = &[131];
 
-const B: i128 = 256;
-
-#[derive(Clone, Debug, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub enum Term<'a> {
     Atom(&'a str),
     Binary(&'a str),
@@ -34,8 +33,8 @@ pub enum Term<'a> {
     NewFloat(f64),
     Nil,
     SmallInteger(u8),
-    SmallBig(i128),
-    LargeBig(i128),
+    SmallBig(num_bigint::BigInt),
+    LargeBig(num_bigint::BigInt),
 }
 
 impl Ord for Term<'_> {
@@ -61,16 +60,18 @@ pub fn parse(bytes: &[u8]) -> ParseResult<&[u8]> {
 
 fn term(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, res) = alt((
-        atom,
         binary,
-        small_integer,
-        small_big,
-        integer,
-        list,
+        atom,
         map,
+        list,
+        integer,
         new_float,
         nil,
+        small_integer,
+        small_big,
+        large_big,
     ))(s)?;
+
     Ok((s, res))
 }
 
@@ -85,37 +86,57 @@ fn binary(s: &[u8]) -> IResult<&[u8], Term> {
 fn new_float(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(NEW_FLOAT_TAG)(s)?;
     let (s, float) = be_f64(s)?;
+
     Ok((s, Term::NewFloat(float)))
 }
 
 fn small_integer(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(SMALL_INTEGER_TAG)(s)?;
     let (s, small_integer) = be_u8(s)?;
+
     Ok((s, Term::SmallInteger(small_integer)))
 }
 
 fn small_big(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(SMALL_BIG_TAG)(s)?;
     let (s, n) = be_u8(s)?;
-    let (s, sign) = be_u8(s)?;
+    let (s, sign_byte) = be_u8(s)?;
     let (s, digits) = count(be_u8, n as usize)(s)?;
 
-    let mut small_big = 0i128;
-    // (d0*B^0 + d1*B^1 + d2*B^2 + ... d(N-1)*B^(n-1))
-    for (i, digit) in digits.into_iter().enumerate() {
-        small_big += i128::from(digit) * i128::pow(B, i as u32)
-    }
+    let sign = if sign_byte == 1 {
+        num_bigint::Sign::Minus
+    } else {
+        num_bigint::Sign::Plus
+    };
 
-    if sign == 1 {
-        small_big *= -1
-    }
+    Ok((
+        s,
+        Term::SmallBig(num_bigint::BigInt::from_radix_le(sign, &digits, 256).unwrap()),
+    ))
+}
 
-    Ok((s, Term::SmallBig(small_big)))
+fn large_big(s: &[u8]) -> IResult<&[u8], Term> {
+    let (s, _) = tag(LARGE_BIG_TAG)(s)?;
+    let (s, n) = be_u32(s)?;
+    let (s, sign_byte) = be_u8(s)?;
+    let (s, digits) = count(be_u8, n as usize)(s)?;
+
+    let sign = if sign_byte == 1 {
+        num_bigint::Sign::Minus
+    } else {
+        num_bigint::Sign::Plus
+    };
+
+    Ok((
+        s,
+        Term::LargeBig(num_bigint::BigInt::from_radix_le(sign, &digits, 256).unwrap()),
+    ))
 }
 
 fn integer(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(INTEGER_TAG)(s)?;
     let (s, integer) = be_i32(s)?;
+
     Ok((s, Term::Integer(integer)))
 }
 
@@ -133,6 +154,7 @@ fn map(s: &[u8]) -> IResult<&[u8], Term> {
 
 fn nil(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(NIL_TAG)(s)?;
+
     Ok((s, Term::Nil))
 }
 
@@ -140,6 +162,8 @@ fn list(s: &[u8]) -> IResult<&[u8], Term> {
     let (s, _) = tag(LIST_TAG)(s)?;
     let (s, number_of_elements) = be_u32(s)?;
     let (s, elements) = count(term, number_of_elements as usize)(s)?;
+    let (s, _term) = nil(s)?;
+
     Ok((s, Term::List(elements)))
 }
 
@@ -158,14 +182,16 @@ mod tests {
     #[test]
     fn string() {
         let string = [131, 109, 0, 0, 0, 5, 104, 101, 108, 108, 111];
-        let (_remaining, parsed) = parse(&string).unwrap();
+        let (remaining, parsed) = parse(&string).unwrap();
+        assert!(remaining.is_empty());
         assert_eq!(parsed, Term::Binary("hello"));
     }
 
     #[test]
     fn empty_map() {
         let empty_map = [131, 116, 0, 0, 0, 0];
-        let (_remaining, parsed) = parse(&empty_map).unwrap();
+        let (remaining, parsed) = parse(&empty_map).unwrap();
+        assert!(remaining.is_empty());
         assert_eq!(parsed, Term::Map(BTreeMap::new()));
     }
 
@@ -178,14 +204,16 @@ mod tests {
 
         let mut btm = BTreeMap::new();
         btm.insert(Term::Binary("hello"), Term::Binary("there"));
-        let (_remaining, parsed) = parse(&map).unwrap();
+        let (remaining, parsed) = parse(&map).unwrap();
+        assert!(remaining.is_empty());
         assert_eq!(parsed, Term::Map(btm));
     }
 
     #[test]
     fn empty_list() {
         let empty_list = [131, 106];
-        let (_remaining, parsed) = parse(&empty_list).unwrap();
+        let (remaining, parsed) = parse(&empty_list).unwrap();
+        assert!(remaining.is_empty());
         assert_eq!(parsed, Term::Nil);
     }
 
@@ -194,42 +222,110 @@ mod tests {
         let list = [
             131, 108, 0, 0, 0, 1, 109, 0, 0, 0, 5, 104, 101, 108, 108, 111, 106,
         ];
-        let (_remaining, parsed) = parse(&list).unwrap();
+        let (remaining, parsed) = parse(&list).unwrap();
         let expected = Term::List(vec![Term::Binary("hello")]);
+        assert!(remaining.is_empty());
         assert_eq!(parsed, expected);
     }
 
     #[test]
     fn small_integer() {
         let small_int = [131, 97, 12];
-        let (_remaining, parsed) = parse(&small_int).unwrap();
+        let (remaining, parsed) = parse(&small_int).unwrap();
         let expected = Term::SmallInteger(12);
+        assert!(remaining.is_empty());
         assert_eq!(parsed, expected);
     }
 
     #[test]
     fn integer() {
         let int = [131, 98, 255, 255, 255, 244];
-        let (_remaining, parsed) = parse(&int).unwrap();
+        let (remaining, parsed) = parse(&int).unwrap();
         let expected = Term::Integer(-12);
+        assert!(remaining.is_empty());
         assert_eq!(parsed, expected);
     }
 
     #[test]
     fn new_float() {
         let float = [131, 70, 64, 64, 12, 204, 204, 204, 204, 205];
-        let (_remaining, parsed) = parse(&float).unwrap();
+        let (remaining, parsed) = parse(&float).unwrap();
         let expected = Term::NewFloat(32.1);
+        assert!(remaining.is_empty());
         assert_eq!(parsed, expected);
     }
 
     #[test]
     fn small_big() {
+        // a big number printed from an iex console
         let small_big = [
             131, 110, 14, 0, 199, 113, 28, 199, 171, 237, 49, 63, 73, 243, 92, 107, 122, 5,
         ];
-        let (_remaining, parsed) = parse(&small_big).unwrap();
-        let expected = Term::SmallBig(111111111111111111111111111111111);
+
+        let (remaining, parsed) = parse(&small_big).unwrap();
+
+        let expected = Term::SmallBig(
+            num_bigint::BigInt::from_radix_le(
+                num_bigint::Sign::Plus,
+                &[
+                    199, 113, 28, 199, 171, 237, 49, 63, 73, 243, 92, 107, 122, 5,
+                ],
+                256,
+            )
+            .unwrap(),
+        );
+        assert!(remaining.is_empty());
+        assert_eq!(parsed, expected);
+    }
+    #[test]
+    fn large_big() {
+        // a really big number printed from an iex console
+        let large_big = [
+            131, 111, 0, 0, 1, 17, 0, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28,
+            199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28,
+            199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28,
+            199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28,
+            199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 171, 73, 10, 20,
+            34, 212, 21, 226, 95, 123, 248, 214, 6, 53, 243, 229, 35, 19, 174, 76, 156, 39, 218,
+            47, 2, 218, 1, 131, 80, 141, 17, 13, 230, 131, 61, 130, 201, 110, 22, 160, 204, 187,
+            230, 8, 227, 198, 134, 77, 167, 137, 116, 53, 70, 144, 160, 12, 160, 102, 159, 78, 254,
+            49, 155, 44, 109, 161, 58, 241, 149, 157, 156, 217, 13, 207, 73, 19, 217, 223, 157, 49,
+            233, 36, 110, 227, 185, 63, 139, 63, 194, 106, 174, 247, 236, 207, 91, 155, 181, 121,
+            152, 222, 251, 92, 87, 56, 160, 64, 208, 164, 171, 64, 32, 197, 205, 168, 66, 248, 248,
+            78, 186, 129, 126, 96, 0, 202, 176, 40, 119, 112, 206, 95, 195, 217, 122, 135, 246, 99,
+            150, 134, 55, 75, 233, 113, 130, 86, 248, 96, 29, 20, 168, 118, 55, 194, 254, 217, 225,
+            204, 14, 45, 56, 52, 33, 218, 221, 106, 209, 33, 122, 132, 162, 236, 106, 134, 75, 63,
+            144, 142, 238, 212, 224, 43, 122, 189, 232, 10, 100, 123, 28, 99, 162, 10, 4,
+        ];
+
+        let (remaining, parsed) = parse(&large_big).unwrap();
+
+        let expected = Term::LargeBig(
+            num_bigint::BigInt::from_radix_le(
+                num_bigint::Sign::Plus,
+                &[
+                    28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199,
+                    113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28,
+                    199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113,
+                    28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199,
+                    113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 199, 113, 28, 171, 73, 10,
+                    20, 34, 212, 21, 226, 95, 123, 248, 214, 6, 53, 243, 229, 35, 19, 174, 76, 156,
+                    39, 218, 47, 2, 218, 1, 131, 80, 141, 17, 13, 230, 131, 61, 130, 201, 110, 22,
+                    160, 204, 187, 230, 8, 227, 198, 134, 77, 167, 137, 116, 53, 70, 144, 160, 12,
+                    160, 102, 159, 78, 254, 49, 155, 44, 109, 161, 58, 241, 149, 157, 156, 217, 13,
+                    207, 73, 19, 217, 223, 157, 49, 233, 36, 110, 227, 185, 63, 139, 63, 194, 106,
+                    174, 247, 236, 207, 91, 155, 181, 121, 152, 222, 251, 92, 87, 56, 160, 64, 208,
+                    164, 171, 64, 32, 197, 205, 168, 66, 248, 248, 78, 186, 129, 126, 96, 0, 202,
+                    176, 40, 119, 112, 206, 95, 195, 217, 122, 135, 246, 99, 150, 134, 55, 75, 233,
+                    113, 130, 86, 248, 96, 29, 20, 168, 118, 55, 194, 254, 217, 225, 204, 14, 45,
+                    56, 52, 33, 218, 221, 106, 209, 33, 122, 132, 162, 236, 106, 134, 75, 63, 144,
+                    142, 238, 212, 224, 43, 122, 189, 232, 10, 100, 123, 28, 99, 162, 10, 4,
+                ],
+                256,
+            )
+            .unwrap(),
+        );
+        assert!(remaining.is_empty());
         assert_eq!(parsed, expected);
     }
 
@@ -242,7 +338,7 @@ mod tests {
             100, 0, 1, 101, 97, 99,
         ];
 
-        let (_remaining, parsed) = parse(&small_map).unwrap();
+        let (remaining, parsed) = parse(&small_map).unwrap();
         let mut map = BTreeMap::new();
         map.insert(Term::Atom("a"), Term::SmallInteger(73));
         map.insert(Term::Atom("b"), Term::Integer(8248));
@@ -250,6 +346,7 @@ mod tests {
         map.insert(Term::Atom("d"), Term::Atom("ok"));
         map.insert(Term::Atom("e"), Term::SmallInteger(99));
         let expected = Term::Map(map);
+        assert!(remaining.is_empty());
         assert_eq!(parsed, expected);
     }
 }
