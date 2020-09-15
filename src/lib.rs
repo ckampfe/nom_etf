@@ -1,6 +1,5 @@
 use nom::branch::alt;
-use nom::bytes::complete::tag;
-use nom::bytes::complete::take;
+use nom::bytes::complete::{tag, take};
 use nom::combinator::complete;
 use nom::multi::count;
 use nom::number::complete::{be_f64, be_i32, be_u16, be_u32, be_u8};
